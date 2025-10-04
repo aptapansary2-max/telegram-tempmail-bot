@@ -1,368 +1,374 @@
+require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const uWS = require('uWebSockets.js');
-const { initDatabase, getPool } = require('./db');
-const InboxListener = require('./inboxListener');
+const { pool, initDatabase } = require('./db');
 const { 
   generateTempEmail, 
-  refreshToken, 
-  getInboxMessages, 
-  getMessageContent,
-  extractOTP,
-  formatEmailContent 
+  getInbox, 
+  getMessage, 
+  detectOTP, 
+  refreshToken 
 } = require('./utils');
-require('dotenv').config();
 
+// Bot token from BotFather
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const PORT = process.env.PORT || 3000;
 
 // Initialize bot
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
-// Initialize inbox listener
-const inboxListener = new InboxListener(bot);
+// Store user sessions (chatId -> { email, token, password })
+const userSessions = new Map();
 
 // Keyboard layout
-const keyboard = {
+const mainKeyboard = {
   keyboard: [
-    [{ text: '📧 My Email' }],
-    [{ text: '🔄 Generate New' }, { text: '📥 Inbox' }],
-    [{ text: '♻️ Recovery' }]
+    [{ text: "📧 My Email" }],
+    [{ text: "🔄 Generate New" }, { text: "📥 Inbox" }],
+    [{ text: "♻️ Recovery" }]
   ],
   resize_keyboard: true,
   one_time_keyboard: false
 };
 
-// User sessions for recovery mode
-const userSessions = new Map();
+// Recovery state tracker
+const recoveryState = new Map();
 
-// Initialize database and start bot
-async function start() {
-  try {
-    await initDatabase();
-    console.log('✅ Bot initialized successfully');
+// Initialize database on startup
+initDatabase().then(() => {
+  console.log('✅ Database initialized');
+}).catch(err => {
+  console.error('❌ Database initialization failed:', err);
+});
 
-    // Start monitoring for all active users
-    await inboxListener.startAllMonitoring();
-
-    // Start WebSocket server for health checks
-    startWebSocketServer();
-
-    console.log(`🤖 Bot is running...`);
-  } catch (error) {
-    console.error('❌ Failed to start bot:', error);
-    process.exit(1);
-  }
-}
-
-// WebSocket server for UptimeRobot and health checks
-function startWebSocketServer() {
-  const app = uWS.App();
-
-  app.get('/health', (res, req) => {
-    res.writeStatus('200 OK')
-       .writeHeader('Content-Type', 'application/json')
-       .end(JSON.stringify({ 
-         status: 'ok', 
-         uptime: process.uptime(),
-         activeMonitors: inboxListener.activeListeners.size
-       }));
-  });
-
-  app.get('/ping', (res, req) => {
-    res.writeStatus('200 OK')
-       .writeHeader('Content-Type', 'text/plain')
-       .end('pong');
-  });
-
-  app.post('/register-user', (res, req) => {
-    let buffer;
-
-    res.onData((ab, isLast) => {
-      const chunk = Buffer.from(ab);
-      if (isLast) {
-        try {
-          const data = JSON.parse(buffer ? Buffer.concat([buffer, chunk]) : chunk);
-          
-          if (data.chat_id && data.email && data.token) {
-            inboxListener.startMonitoring(data.chat_id, data.email, data.token);
-            res.writeStatus('200 OK')
-               .writeHeader('Content-Type', 'application/json')
-               .end(JSON.stringify({ success: true }));
-          } else {
-            res.writeStatus('400 Bad Request')
-               .end(JSON.stringify({ error: 'Missing required fields' }));
-          }
-        } catch (e) {
-          res.writeStatus('400 Bad Request')
-             .end(JSON.stringify({ error: 'Invalid JSON' }));
-        }
-      } else {
-        if (buffer) {
-          buffer = Buffer.concat([buffer, chunk]);
-        } else {
-          buffer = Buffer.concat([chunk]);
-        }
-      }
-    });
-  });
-
-  app.listen(PORT, (token) => {
-    if (token) {
-      console.log(`🌐 WebSocket server listening on port ${PORT}`);
-    } else {
-      console.log('❌ Failed to start WebSocket server');
-    }
-  });
-}
-
-// Handle /start command
+// /start command
 bot.onText(/\/start/, async (msg) => {
   const chatId = msg.chat.id;
-  const username = msg.from.username || '';
   const firstName = msg.from.first_name || 'User';
-
-  try {
-    const pool = getPool();
-
-    // Insert or update user
-    await pool.query(
-      `INSERT INTO telegram_users (chat_id, username, first_name) 
-       VALUES (?, ?, ?) 
-       ON DUPLICATE KEY UPDATE 
-       username = VALUES(username), 
-       first_name = VALUES(first_name), 
-       last_activity = NOW()`,
-      [chatId, username, firstName]
-    );
-
-    const welcomeMsg = `😜 Hey ${firstName} Welcome To OUR BoT\n\n🧑‍💻 BoT Created BY : @tricksmaster111`;
-
-    await bot.sendMessage(chatId, welcomeMsg, { reply_markup: keyboard });
-  } catch (error) {
-    console.error('Error handling /start:', error);
-    await bot.sendMessage(chatId, '❌ An error occurred. Please try again!');
-  }
+  
+  const welcomeMessage = `😜 Hey ${firstName} Welcome To OUR BoT\n🧑‍💻 BoT Created BY : @tricksmaster111`;
+  
+  bot.sendMessage(chatId, welcomeMessage, {
+    reply_markup: mainKeyboard
+  });
 });
 
 // Handle button clicks
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const text = msg.text;
-
-  if (!text || text.startsWith('/')) {
-    return;
-  }
-
-  const pool = getPool();
-
+  
+  if (!text) return;
+  
   try {
-    // Get user data
-    const [users] = await pool.query(
-      'SELECT * FROM telegram_users WHERE chat_id = ?',
-      [chatId]
-    );
-
-    const user = users[0];
-
-    // Check if user is in recovery mode
-    if (userSessions.get(chatId) === 'recovery_mode') {
-      await handleRecoveryEmail(chatId, text, user);
-      return;
-    }
-
-    switch (text) {
-      case '📧 My Email':
-        await handleMyEmail(chatId, user);
-        break;
-
-      case '🔄 Generate New':
-        await handleGenerateNew(chatId);
-        break;
-
-      case '📥 Inbox':
-        await handleInbox(chatId, user);
-        break;
-
-      case '♻️ Recovery':
-        await handleRecovery(chatId);
-        break;
-
-      default:
-        await bot.sendMessage(chatId, 'Please use the buttons below to interact with the bot!', {
-          reply_markup: keyboard
+    // 📧 My Email
+    if (text === '📧 My Email') {
+      const session = userSessions.get(chatId);
+      
+      if (!session || !session.email) {
+        bot.sendMessage(chatId, '❌ No email found! Please generate a new email first.', {
+          reply_markup: mainKeyboard
         });
-        break;
+        return;
+      }
+      
+      bot.sendMessage(chatId, `🎊 Here Is Your Email Address 👇\n📬 Email ID : ${session.email} 👈`, {
+        reply_markup: mainKeyboard
+      });
     }
+    
+    // 🔄 Generate New
+    else if (text === '🔄 Generate New') {
+      bot.sendMessage(chatId, '⏳ Generating new email...', {
+        reply_markup: mainKeyboard
+      });
+      
+      const result = await generateTempEmail();
+      
+      if (result.error) {
+        bot.sendMessage(chatId, `❌ Failed to generate email: ${result.error}`, {
+          reply_markup: mainKeyboard
+        });
+        return;
+      }
+      
+      // Store in session
+      userSessions.set(chatId, {
+        email: result.email,
+        token: result.token,
+        password: result.password
+      });
+      
+      // Save to MySQL database
+      try {
+        await pool.query(
+          'INSERT INTO emails (email, password, token, created_at, last_access) VALUES (?, ?, ?, NOW(), NOW())',
+          [result.email, result.password, result.token]
+        );
+      } catch (dbErr) {
+        console.error('Database save error:', dbErr);
+      }
+      
+      bot.sendMessage(chatId, `♻️ New Email Generated Successfully ✅\n📬 Email ID : ${result.email} 👈`, {
+        reply_markup: mainKeyboard
+      });
+      
+      // Start auto-checking inbox every 10 seconds
+      startInboxPolling(chatId);
+    }
+    
+    // 📥 Inbox
+    else if (text === '📥 Inbox') {
+      const session = userSessions.get(chatId);
+      
+      if (!session || !session.email) {
+        bot.sendMessage(chatId, '❌ No active email! Generate one first.', {
+          reply_markup: mainKeyboard
+        });
+        return;
+      }
+      
+      bot.sendMessage(chatId, '📬 Checking inbox...', {
+        reply_markup: mainKeyboard
+      });
+      
+      // Check if token is still valid
+      let currentToken = session.token;
+      const messages = await getInbox(currentToken);
+      
+      // If token expired, refresh it
+      if (messages.error && messages.error.includes('401')) {
+        const newToken = await refreshToken(session.email, session.password);
+        if (newToken) {
+          currentToken = newToken;
+          session.token = newToken;
+          userSessions.set(chatId, session);
+          
+          // Update in database
+          await pool.query(
+            'UPDATE emails SET token = ?, last_access = NOW() WHERE email = ?',
+            [newToken, session.email]
+          );
+          
+          // Retry with new token
+          const retryMessages = await getInbox(currentToken);
+          displayInbox(chatId, retryMessages);
+        } else {
+          bot.sendMessage(chatId, '❌ Token refresh failed. Please generate a new email.', {
+            reply_markup: mainKeyboard
+          });
+        }
+      } else {
+        displayInbox(chatId, messages);
+      }
+    }
+    
+    // ♻️ Recovery
+    else if (text === '♻️ Recovery') {
+      recoveryState.set(chatId, 'waiting_email');
+      bot.sendMessage(chatId, '♻️ Please Enter Recovery Email 📨', {
+        reply_markup: { remove_keyboard: true }
+      });
+    }
+    
+    // Handle recovery email input
+    else if (recoveryState.get(chatId) === 'waiting_email') {
+      const recoveryEmail = text.trim();
+      
+      // Validate email format
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      if (!emailRegex.test(recoveryEmail)) {
+        bot.sendMessage(chatId, '❌ Invalid email format! Please try again.', {
+          reply_markup: mainKeyboard
+        });
+        recoveryState.delete(chatId);
+        return;
+      }
+      
+      // Check if email exists in database
+      try {
+        const [rows] = await pool.query(
+          'SELECT email, password, token FROM emails WHERE email = ?',
+          [recoveryEmail]
+        );
+        
+        if (rows.length === 0) {
+          bot.sendMessage(chatId, '❌ Email not found in database!', {
+            reply_markup: mainKeyboard
+          });
+          recoveryState.delete(chatId);
+          return;
+        }
+        
+        const emailData = rows[0];
+        
+        // Refresh token
+        const newToken = await refreshToken(emailData.email, emailData.password);
+        if (newToken) {
+          // Update session
+          userSessions.set(chatId, {
+            email: emailData.email,
+            token: newToken,
+            password: emailData.password
+          });
+          
+          // Update database
+          await pool.query(
+            'UPDATE emails SET token = ?, last_access = NOW() WHERE email = ?',
+            [newToken, emailData.email]
+          );
+          
+          bot.sendMessage(chatId, `✅ Recovery Email Linked Successfully 🎉\n📬 Your Recovery Email : ${emailData.email}`, {
+            reply_markup: mainKeyboard
+          });
+          
+          // Start polling for this recovered email
+          startInboxPolling(chatId);
+        } else {
+          bot.sendMessage(chatId, '❌ Failed to refresh token. Email may be expired.', {
+            reply_markup: mainKeyboard
+          });
+        }
+      } catch (dbErr) {
+        console.error('Recovery error:', dbErr);
+        bot.sendMessage(chatId, '❌ Database error during recovery.', {
+          reply_markup: mainKeyboard
+        });
+      }
+      
+      recoveryState.delete(chatId);
+    }
+    
   } catch (error) {
-    console.error('Error handling message:', error);
-    await bot.sendMessage(chatId, '❌ An error occurred. Please try again!', {
-      reply_markup: keyboard
+    console.error('Message handling error:', error);
+    bot.sendMessage(chatId, '❌ An error occurred. Please try again.', {
+      reply_markup: mainKeyboard
     });
   }
 });
 
-// Handle My Email button
-async function handleMyEmail(chatId, user) {
-  if (user && user.current_email) {
-    const msg = `🎊 Here Is Your Email Address 👇\n\n📬 Email ID : ${user.current_email} 👈`;
-    await bot.sendMessage(chatId, msg, { reply_markup: keyboard });
-  } else {
-    await bot.sendMessage(chatId, '❌ No active email. Please generate a new one first!', {
-      reply_markup: keyboard
-    });
-  }
-}
-
-// Handle Generate New button
-async function handleGenerateNew(chatId) {
-  const emailData = await generateTempEmail(chatId);
-
-  if (emailData) {
-    const msg = `♻️ New Email Generated Successfully ✅\n\n📬 Email ID : ${emailData.email} 👈`;
-    await bot.sendMessage(chatId, msg, { reply_markup: keyboard });
-
-    // Start monitoring for this email
-    inboxListener.startMonitoring(chatId, emailData.email, emailData.token);
-  } else {
-    await bot.sendMessage(chatId, '❌ Failed to generate email. Please try again!', {
-      reply_markup: keyboard
-    });
-  }
-}
-
-// Handle Inbox button
-async function handleInbox(chatId, user) {
-  if (!user || !user.current_email || !user.current_token) {
-    await bot.sendMessage(chatId, '❌ No active email. Please generate one first!', {
-      reply_markup: keyboard
+// Display inbox messages
+function displayInbox(chatId, messages) {
+  if (messages.error) {
+    bot.sendMessage(chatId, `❌ Error: ${messages.error}`, {
+      reply_markup: mainKeyboard
     });
     return;
   }
-
-  let messages = await getInboxMessages(user.current_token);
-
-  // Try to refresh token if failed
-  if (!messages || !messages['hydra:member']) {
-    const pool = getPool();
-    const [rows] = await pool.query(
-      'SELECT password FROM user_emails WHERE email = ? AND chat_id = ?',
-      [user.current_email, chatId]
-    );
-
-    if (rows.length > 0) {
-      const newToken = await refreshToken(user.current_email, rows[0].password, chatId);
-      if (newToken) {
-        messages = await getInboxMessages(newToken);
+  
+  if (!messages || messages.length === 0) {
+    bot.sendMessage(chatId, '📭 No messages in inbox yet!', {
+      reply_markup: mainKeyboard
+    });
+    return;
+  }
+  
+  messages.forEach(async (msg) => {
+    const messageText = `📩 New Mail Received In Your Email ID 🪧\n📇 From : ${msg.from}\n🗒️ Subject : ${msg.subject || 'No Subject'}\n💬 Text : ${msg.intro || 'No preview available'}`;
+    
+    // Fetch full message content
+    const session = userSessions.get(chatId);
+    if (session) {
+      const fullMsg = await getMessage(session.token, msg.id);
+      if (fullMsg && !fullMsg.error) {
+        const otp = detectOTP(fullMsg.text || fullMsg.html || '');
+        
+        if (otp) {
+          bot.sendMessage(chatId, `${messageText}\n\n👉 OTP : \`${otp}\``, {
+            parse_mode: 'Markdown',
+            reply_markup: mainKeyboard
+          });
+        } else {
+          bot.sendMessage(chatId, messageText, {
+            reply_markup: mainKeyboard
+          });
+        }
       }
     }
-  }
-
-  if (!messages || !messages['hydra:member'] || messages['hydra:member'].length === 0) {
-    await bot.sendMessage(chatId, '📪 No messages in your inbox yet!', {
-      reply_markup: keyboard
-    });
-    return;
-  }
-
-  const latestMessage = messages['hydra:member'][0];
-  const messageDetails = await getMessageContent(latestMessage.id, user.current_token);
-
-  if (messageDetails) {
-    const content = formatEmailContent(messageDetails);
-    const otp = extractOTP(content);
-
-    let inboxMsg = '📩 New Mail Received In Your Email ID 🪧\n\n';
-    inboxMsg += `📇 From : ${latestMessage.from.address}\n\n`;
-    inboxMsg += `🗒️ Subject : ${latestMessage.subject}\n\n`;
-    inboxMsg += `💬 Text : *${content}*`;
-
-    if (otp) {
-      inboxMsg += `\n\n👉 OTP : \`${otp}\``;
-    }
-
-    await bot.sendMessage(chatId, inboxMsg, { 
-      parse_mode: 'Markdown',
-      reply_markup: keyboard 
-    });
-  } else {
-    await bot.sendMessage(chatId, '📪 No messages in your inbox yet!', {
-      reply_markup: keyboard
-    });
-  }
-}
-
-// Handle Recovery button
-async function handleRecovery(chatId) {
-  userSessions.set(chatId, 'recovery_mode');
-  await bot.sendMessage(chatId, '♻️ Please Enter Recovery Email 📨', {
-    reply_markup: keyboard
   });
 }
 
-// Handle recovery email input
-async function handleRecoveryEmail(chatId, email, user) {
-  userSessions.delete(chatId);
+// Polling mechanism for real-time inbox (every 10 seconds)
+const pollingIntervals = new Map();
 
-  // Validate email format
-  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-  if (!emailRegex.test(email)) {
-    await bot.sendMessage(chatId, '❌ Please enter a valid email address!', {
-      reply_markup: keyboard
-    });
-    return;
+function startInboxPolling(chatId) {
+  // Clear existing interval if any
+  if (pollingIntervals.has(chatId)) {
+    clearInterval(pollingIntervals.get(chatId));
   }
-
-  const pool = getPool();
-
-  // Try to recover email from history
-  const [rows] = await pool.query(
-    'SELECT email, password, token FROM user_emails WHERE email = ? AND chat_id = ?',
-    [email, chatId]
-  );
-
-  if (rows.length > 0) {
-    const emailData = rows[0];
-    const newToken = await refreshToken(emailData.email, emailData.password, chatId);
-
-    if (newToken) {
-      const msg = `♻️ Recovery Email Successfully ✅\n\n📬 Recovery Email : ${emailData.email} 👈`;
-      await bot.sendMessage(chatId, msg, { reply_markup: keyboard });
-
-      // Start monitoring
-      inboxListener.startMonitoring(chatId, emailData.email, newToken);
-    } else {
-      await bot.sendMessage(chatId, '❌ Failed to recover email. Please try again.', {
-        reply_markup: keyboard
-      });
+  
+  let lastMessageCount = 0;
+  
+  const interval = setInterval(async () => {
+    const session = userSessions.get(chatId);
+    if (!session || !session.email) {
+      clearInterval(interval);
+      pollingIntervals.delete(chatId);
+      return;
     }
-  } else {
-    // Save as recovery email
-    await pool.query(
-      'UPDATE telegram_users SET recovery_email = ? WHERE chat_id = ?',
-      [email, chatId]
-    );
-
-    const msg = `✅ Recovery Email Linked Successfully 🎉\n\n📬 Your Recovery Email : ${email}`;
-    await bot.sendMessage(chatId, msg, { reply_markup: keyboard });
-  }
+    
+    const messages = await getInbox(session.token);
+    
+    if (!messages.error && messages.length > lastMessageCount) {
+      // New messages detected
+      const newMessages = messages.slice(lastMessageCount);
+      newMessages.forEach(async (msg) => {
+        const fullMsg = await getMessage(session.token, msg.id);
+        if (fullMsg && !fullMsg.error) {
+          const otp = detectOTP(fullMsg.text || fullMsg.html || '');
+          
+          let messageText = `📩 New Mail Received In Your Email ID 🪧\n📇 From : ${msg.from}\n🗒️ Subject : ${msg.subject || 'No Subject'}\n💬 Text : ${fullMsg.intro || 'No preview available'}`;
+          
+          if (otp) {
+            messageText += `\n\n👉 OTP : \`${otp}\``;
+            bot.sendMessage(chatId, messageText, {
+              parse_mode: 'Markdown',
+              reply_markup: mainKeyboard
+            });
+          } else {
+            bot.sendMessage(chatId, messageText, {
+              reply_markup: mainKeyboard
+            });
+          }
+        }
+      });
+      
+      lastMessageCount = messages.length;
+    }
+  }, 10000); // Check every 10 seconds
+  
+  pollingIntervals.set(chatId, interval);
 }
 
-// Error handling
-bot.on('polling_error', (error) => {
-  console.error('Polling error:', error);
+// WebSocket server for health checks (UptimeRobot)
+const wsApp = uWS.App().get('/health', (res, req) => {
+  res.writeStatus('200 OK').end(JSON.stringify({ 
+    status: 'ok', 
+    uptime: process.uptime(),
+    activeSessions: userSessions.size
+  }));
+}).get('/', (res, req) => {
+  res.writeStatus('200 OK').end('Advanced Temp Email Bot is running! 🚀');
+}).listen(PORT, (token) => {
+  if (token) {
+    console.log(`✅ WebSocket server listening on port ${PORT}`);
+    console.log(`🤖 Telegram bot is active!`);
+  } else {
+    console.log('❌ Failed to start WebSocket server');
+  }
 });
 
+// Graceful shutdown
 process.on('SIGINT', () => {
-  console.log('🛑 Shutting down...');
-  inboxListener.stopAllMonitoring();
+  console.log('\n🛑 Shutting down gracefully...');
+  pollingIntervals.forEach((interval) => clearInterval(interval));
+  pool.end();
   process.exit(0);
 });
 
 process.on('SIGTERM', () => {
-  console.log('🛑 Shutting down...');
-  inboxListener.stopAllMonitoring();
+  console.log('\n🛑 Shutting down gracefully...');
+  pollingIntervals.forEach((interval) => clearInterval(interval));
+  pool.end();
   process.exit(0);
 });
-
-// Start the bot
-start();
