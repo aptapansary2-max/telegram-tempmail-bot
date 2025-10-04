@@ -1,0 +1,23 @@
+{
+  "name": "telegram-tempmail-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot with real-time temporary email monitoring",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "keywords": ["telegram", "bot", "tempmail", "websocket"],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "node-telegram-bot-api": "^0.64.0",
+    "mysql2": "^3.6.5",
+    "axios": "^1.6.2",
+    "uWebSockets.js": "github:uNetworking/uWebSockets.js#v20.38.0",
+    "dotenv": "^16.3.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  }
+}
