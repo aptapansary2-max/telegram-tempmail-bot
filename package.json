@@ -1,23 +1,31 @@
 {
-  "name": "telegram-tempmail-bot",
+  "name": "advanced-temp-email-bot",
   "version": "1.0.0",
-  "description": "Telegram bot with real-time temporary email monitoring",
+  "description": "Telegram bot for temporary email with real-time inbox",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
     "dev": "nodemon index.js"
   },
-  "keywords": ["telegram", "bot", "tempmail", "websocket"],
-  "author": "",
-  "license": "ISC",
+  "keywords": [
+    "telegram",
+    "bot",
+    "temp-email",
+    "disposable-email"
+  ],
+  "author": "@tricksmaster111",
+  "license": "MIT",
   "dependencies": {
     "node-telegram-bot-api": "^0.64.0",
     "mysql2": "^3.6.5",
     "axios": "^1.6.2",
-    "uWebSockets.js": "github:uNetworking/uWebSockets.js#v20.38.0",
-    "dotenv": "^16.3.1"
+    "dotenv": "^16.3.1",
+    "uWebSockets.js": "github:uNetworking/uWebSockets.js#v20.38.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
