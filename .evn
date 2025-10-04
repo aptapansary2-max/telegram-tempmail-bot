@@ -1,0 +1,12 @@
+# Telegram Bot Configuration
+BOT_TOKEN=8368251170:AAEelPG6m875saeq_mqq81c04cwUv05twyE
+
+# MySQL Database Configuration
+DB_HOST=localhost
+DB_USER=cztldhwx_tampemail
+DB_PASS=Aptap786920
+DB_NAME=cztldhwx_tampemail
+
+# Server Configuration
+PORT=3000
+WEBHOOK_URL=https://your-render-app.onrender.com
