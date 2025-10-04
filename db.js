@@ -1,193 +1,133 @@
 const mysql = require('mysql2/promise');
 
-// MySQL connection configuration (using your hosting database)
-const dbConfig = {
-  host: process.env.DB_HOST || 'cashearnersofficial.xyz/',
-  user: process.env.DB_USER || 'cztldhwx_tampemail',
-  password: process.env.DB_PASS || 'Aptap786920',
-  database: process.env.DB_NAME || 'cztldhwx_tampemail',
+// Create connection pool
+const pool = mysql.createPool({
+  host: process.env.DB_HOST,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME,
+  port: process.env.DB_PORT || 3306,
   waitForConnections: true,
   connectionLimit: 10,
   queueLimit: 0,
-  connectTimeout: 30000,
-  acquireTimeout: 30000,
-  timeout: 30000
-};
+  enableKeepAlive: true,
+  keepAliveInitialDelay: 0,
+  connectTimeout: 20000, // 20 seconds timeout
+  acquireTimeout: 20000,
+  timezone: '+00:00'
+});
 
-// Create connection pool
-const pool = mysql.createPool(dbConfig);
-
-// Test database connection
-async function testConnection() {
-  try {
-    const connection = await pool.getConnection();
-    console.log('✅ MySQL database connected successfully!');
-    connection.release();
-    return true;
-  } catch (error) {
-    console.error('❌ MySQL connection failed:', error.message);
-    return false;
-  }
-}
-
-// Initialize database tables (create if not exists)
+// Initialize database tables
 async function initDatabase() {
-  try {
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS emails (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        email VARCHAR(255) UNIQUE NOT NULL,
-        password VARCHAR(255) NOT NULL,
-        token TEXT NOT NULL,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        last_access DATETIME DEFAULT CURRENT_TIMESTAMP,
-        INDEX idx_email (email),
-        INDEX idx_created (created_at),
-        INDEX idx_last_access (last_access)
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  let retries = 3;
+  while (retries > 0) {
+    try {
+      // Test connection first
+      const connection = await pool.getConnection();
+      console.log('✅ Database connection successful');
+      connection.release();
+
+      // Create user_sessions table if not exists
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS user_sessions (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          telegram_id BIGINT NOT NULL,
+          email VARCHAR(255) NOT NULL,
+          password VARCHAR(255) NOT NULL,
+          token TEXT NOT NULL,
+          recovery_email VARCHAR(255) DEFAULT NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          last_access TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          UNIQUE KEY unique_telegram_email (telegram_id, email),
+          INDEX idx_telegram_id (telegram_id),
+          INDEX idx_email (email)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+      `);
+
+    // Verify existing emails table
+    const [tables] = await pool.query(`
+      SHOW TABLES LIKE 'emails'
     `);
-    
-    console.log('✅ Database table "emails" ready');
-    
-    // Optional: Create table for recovery emails (if needed in future)
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS recovery_links (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        email VARCHAR(255) NOT NULL,
-        recovery_email VARCHAR(255) NOT NULL,
-        linked_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        FOREIGN KEY (email) REFERENCES emails(email) ON DELETE CASCADE,
-        INDEX idx_recovery (recovery_email)
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-    `);
-    
-    console.log('✅ Database table "recovery_links" ready');
-    
-    // Create table for message tracking (optional, for analytics)
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS messages_log (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        email VARCHAR(255) NOT NULL,
-        message_id VARCHAR(255) NOT NULL,
-        from_address VARCHAR(255),
-        subject TEXT,
-        has_otp BOOLEAN DEFAULT FALSE,
-        received_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-        INDEX idx_email_log (email),
-        INDEX idx_message_id (message_id)
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-    `);
-    
-    console.log('✅ Database table "messages_log" ready');
-    
-    return true;
+
+    if (tables.length === 0) {
+      // Create emails table if not exists (from your existing PHP code)
+      await pool.query(`
+        CREATE TABLE IF NOT EXISTS emails (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          email VARCHAR(255) NOT NULL UNIQUE,
+          password VARCHAR(255) NOT NULL,
+          token TEXT NOT NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          last_access TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          INDEX idx_email (email)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+      `);
+    }
+
+    console.log('✅ Database tables verified/created');
+    return;
   } catch (error) {
-    console.error('❌ Database initialization error:', error.message);
-    throw error;
+    console.error(`❌ Error initializing database (${retries} retries left):`, error.message);
+    retries--;
+    if (retries > 0) {
+      console.log('🔄 Retrying in 5 seconds...');
+      await new Promise(resolve => setTimeout(resolve, 5000));
+    } else {
+      console.error('❌ Failed to initialize database after all retries');
+      throw error;
+    }
   }
 }
-
-// Clean up old emails (optional - run periodically to remove expired emails)
-async function cleanupOldEmails(daysOld = 7) {
-  try {
-    const [result] = await pool.query(
-      'DELETE FROM emails WHERE last_access < DATE_SUB(NOW(), INTERVAL ? DAY)',
-      [daysOld]
-    );
-    
-    console.log(`🗑️ Cleaned up ${result.affectedRows} old emails`);
-    return result.affectedRows;
-  } catch (error) {
-    console.error('Cleanup error:', error.message);
-    return 0;
-  }
 }
 
-// Get email details from database
-async function getEmailFromDB(email) {
-  try {
-    const [rows] = await pool.query(
-      'SELECT * FROM emails WHERE email = ?',
-      [email]
-    );
-    return rows[0] || null;
-  } catch (error) {
-    console.error('Get email error:', error.message);
-    return null;
-  }
-}
-
-// Update last access time
+// Helper: Update last access timestamp
 async function updateLastAccess(email) {
   try {
     await pool.query(
       'UPDATE emails SET last_access = NOW() WHERE email = ?',
       [email]
     );
-    return true;
   } catch (error) {
-    console.error('Update last access error:', error.message);
-    return false;
+    console.error('Error updating last access:', error);
   }
 }
 
-// Update token in database
-async function updateToken(email, newToken) {
+// Helper: Save email to database
+async function saveEmail(email, password, token) {
   try {
     await pool.query(
-      'UPDATE emails SET token = ?, last_access = NOW() WHERE email = ?',
-      [newToken, email]
+      `INSERT INTO emails (email, password, token, created_at, last_access) 
+       VALUES (?, ?, ?, NOW(), NOW())
+       ON DUPLICATE KEY UPDATE 
+       password = VALUES(password), 
+       token = VALUES(token),
+       last_access = NOW()`,
+      [email, password, token]
     );
-    return true;
   } catch (error) {
-    console.error('Update token error:', error.message);
-    return false;
+    console.error('Error saving email:', error);
+    throw error;
   }
 }
 
-// Log message receipt (optional - for analytics)
-async function logMessage(email, messageId, fromAddress, subject, hasOTP = false) {
+// Helper: Get email from database
+async function getEmail(email) {
   try {
-    await pool.query(
-      'INSERT INTO messages_log (email, message_id, from_address, subject, has_otp) VALUES (?, ?, ?, ?, ?)',
-      [email, messageId, fromAddress, subject, hasOTP]
+    const [rows] = await pool.query(
+      'SELECT * FROM emails WHERE email = ?',
+      [email]
     );
-    return true;
+    return rows.length > 0 ? rows[0] : null;
   } catch (error) {
-    // Ignore duplicate key errors
-    if (error.code !== 'ER_DUP_ENTRY') {
-      console.error('Log message error:', error.message);
-    }
-    return false;
-  }
-}
-
-// Get statistics (optional - for admin panel)
-async function getStats() {
-  try {
-    const [emailCount] = await pool.query('SELECT COUNT(*) as total FROM emails');
-    const [messageCount] = await pool.query('SELECT COUNT(*) as total FROM messages_log');
-    const [otpCount] = await pool.query('SELECT COUNT(*) as total FROM messages_log WHERE has_otp = TRUE');
-    
-    return {
-      totalEmails: emailCount[0].total,
-      totalMessages: messageCount[0].total,
-      totalOTPs: otpCount[0].total
-    };
-  } catch (error) {
-    console.error('Get stats error:', error.message);
+    console.error('Error getting email:', error);
     return null;
   }
 }
 
 module.exports = {
   pool,
-  testConnection,
   initDatabase,
-  cleanupOldEmails,
-  getEmailFromDB,
   updateLastAccess,
-  updateToken,
-  logMessage,
-  getStats
+  saveEmail,
+  getEmail
 };
