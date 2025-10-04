@@ -1,148 +1,148 @@
 const axios = require('axios');
-const { getPool } = require('./db');
-const { getInboxMessages, getMessageContent, extractOTP, formatEmailContent } = require('./utils');
 
-class InboxListener {
-  constructor(bot) {
-    this.bot = bot;
-    this.activeListeners = new Map();
-    this.checkInterval = 10000; // Check every 10 seconds
-    this.processedMessages = new Set();
+const MAIL_TM_API = process.env.MAIL_TM_API || 'https://api.mail.tm';
+const POLL_INTERVAL = 5000; // 5 seconds
+
+// Store active listeners
+const activeListeners = new Map();
+
+// Start listening for new messages
+function startInboxListener(email, token, onNewMessage) {
+  // Stop existing listener if any
+  if (activeListeners.has(email)) {
+    stopInboxListener(email);
   }
 
-  // Start monitoring for a user
-  startMonitoring(chatId, email, token) {
-    if (this.activeListeners.has(chatId)) {
-      clearInterval(this.activeListeners.get(chatId));
-    }
+  let lastMessageIds = new Set();
+  let isFirstFetch = true;
 
-    console.log(`📡 Started monitoring for chat ${chatId} - ${email}`);
+  // Initial fetch to get existing message IDs
+  fetchMessages();
 
-    const intervalId = setInterval(async () => {
-      await this.checkNewMessages(chatId, email, token);
-    }, this.checkInterval);
+  const intervalId = setInterval(fetchMessages, POLL_INTERVAL);
 
-    this.activeListeners.set(chatId, intervalId);
-  }
+  activeListeners.set(email, {
+    intervalId,
+    token,
+    onNewMessage
+  });
 
-  // Stop monitoring for a user
-  stopMonitoring(chatId) {
-    if (this.activeListeners.has(chatId)) {
-      clearInterval(this.activeListeners.get(chatId));
-      this.activeListeners.delete(chatId);
-      console.log(`🛑 Stopped monitoring for chat ${chatId}`);
-    }
-  }
+  console.log(`📡 Started inbox listener for ${email}`);
 
-  // Check for new messages
-  async checkNewMessages(chatId, email, token) {
+  async function fetchMessages() {
     try {
-      const messages = await getInboxMessages(token);
+      const response = await axios.get(
+        `${MAIL_TM_API}/messages`,
+        {
+          headers: { 'Authorization': `Bearer ${token}` },
+          timeout: 8000,
+          validateStatus: function (status) {
+            return status < 500; // Accept any status < 500
+          }
+        }
+      );
 
-      if (!messages || !messages['hydra:member'] || messages['hydra:member'].length === 0) {
+      if (response.status === 401 || response.status === 403) {
+        console.log(`⚠️ Token expired for ${email}, stopping listener`);
+        stopInboxListener(email);
         return;
       }
 
-      const latestMessages = messages['hydra:member'].slice(0, 3); // Check last 3 messages
-
-      for (const message of latestMessages) {
-        const messageKey = `${chatId}_${message.id}`;
-
-        // Skip if already processed
-        if (this.processedMessages.has(messageKey)) {
-          continue;
-        }
-
-        // Mark as processed
-        this.processedMessages.add(messageKey);
-
-        // Get full message content
-        const messageDetails = await getMessageContent(message.id, token);
-
-        if (messageDetails) {
-          await this.notifyUser(chatId, message, messageDetails);
-        }
+      if (response.status !== 200) {
+        console.error(`API error for ${email}: ${response.status}`);
+        return;
       }
 
-      // Clean up old processed messages (keep last 100)
-      if (this.processedMessages.size > 100) {
-        const entries = Array.from(this.processedMessages);
-        this.processedMessages = new Set(entries.slice(-100));
+      const messages = response.data['hydra:member'] || [];
+      const currentMessageIds = new Set(messages.map(m => m.id));
+
+      // On first fetch, just store IDs without notifying
+      if (isFirstFetch) {
+        lastMessageIds = currentMessageIds;
+        isFirstFetch = false;
+        return;
       }
-    } catch (error) {
-      console.error(`Error checking messages for ${chatId}:`, error.message);
 
-      // Try to refresh token if unauthorized
-      if (error.response && error.response.status === 401) {
-        const pool = getPool();
-        const [rows] = await pool.query(
-          'SELECT password FROM user_emails WHERE email = ? AND chat_id = ?',
-          [email, chatId]
-        );
-
-        if (rows.length > 0) {
-          const { refreshToken } = require('./utils');
-          const newToken = await refreshToken(email, rows[0].password, chatId);
+      // Find new messages
+      for (const message of messages) {
+        if (!lastMessageIds.has(message.id)) {
+          // New message detected!
+          console.log(`📩 New message detected for ${email}: ${message.subject}`);
           
-          if (newToken) {
-            this.startMonitoring(chatId, email, newToken);
+          // Fetch full message content
+          try {
+            const fullMessage = await axios.get(
+              `${MAIL_TM_API}/messages/${message.id}`,
+              {
+                headers: { 'Authorization': `Bearer ${token}` },
+                timeout: 8000
+              }
+            );
+
+            onNewMessage(fullMessage.data);
+          } catch (error) {
+            console.error('Error fetching full message:', error.message);
+            // Fallback to basic message data
+            onNewMessage(message);
           }
         }
       }
-    }
-  }
 
-  // Notify user about new message
-  async notifyUser(chatId, message, messageDetails) {
-    try {
-      const content = formatEmailContent(messageDetails);
-      const otp = extractOTP(content);
-
-      let notificationMsg = '📩 New Mail Received In Your Email ID 🪧\n\n';
-      notificationMsg += `📇 From : ${message.from.address}\n\n`;
-      notificationMsg += `🗒️ Subject : ${message.subject}\n\n`;
-      notificationMsg += `💬 Text : *${content}*`;
-
-      if (otp) {
-        notificationMsg += `\n\n👉 OTP : \`${otp}\``;
-      }
-
-      await this.bot.sendMessage(chatId, notificationMsg, { 
-        parse_mode: 'Markdown'
-      });
-
-      console.log(`✅ Notified user ${chatId} about new email`);
+      lastMessageIds = currentMessageIds;
     } catch (error) {
-      console.error(`Error notifying user ${chatId}:`, error.message);
-    }
-  }
-
-  // Start monitoring all active users
-  async startAllMonitoring() {
-    try {
-      const pool = getPool();
-      const [users] = await pool.query(
-        'SELECT chat_id, current_email, current_token FROM telegram_users WHERE current_email IS NOT NULL AND current_token IS NOT NULL'
-      );
-
-      console.log(`🚀 Starting monitoring for ${users.length} active users`);
-
-      for (const user of users) {
-        this.startMonitoring(user.chat_id, user.current_email, user.current_token);
+      if (error.response && error.response.status === 401) {
+        console.log(`⚠️ Token expired for ${email}, stopping listener`);
+        stopInboxListener(email);
+      } else if (error.code !== 'ECONNABORTED') {
+        console.error(`Error polling inbox for ${email}:`, error.message);
       }
-    } catch (error) {
-      console.error('Error starting all monitoring:', error);
     }
-  }
-
-  // Stop all monitoring
-  stopAllMonitoring() {
-    for (const [chatId, intervalId] of this.activeListeners.entries()) {
-      clearInterval(intervalId);
-    }
-    this.activeListeners.clear();
-    console.log('🛑 Stopped all monitoring');
   }
 }
 
-module.exports = InboxListener;
+// Stop listening for an email
+function stopInboxListener(email) {
+  if (activeListeners.has(email)) {
+    const listener = activeListeners.get(email);
+    clearInterval(listener.intervalId);
+    activeListeners.delete(email);
+    console.log(`🛑 Stopped inbox listener for ${email}`);
+  }
+}
+
+// Stop all listeners
+function stopAllListeners() {
+  console.log(`🛑 Stopping all ${activeListeners.size} inbox listeners`);
+  activeListeners.forEach((listener, email) => {
+    clearInterval(listener.intervalId);
+  });
+  activeListeners.clear();
+}
+
+// Update token for an active listener
+function updateListenerToken(email, newToken) {
+  if (activeListeners.has(email)) {
+    const listener = activeListeners.get(email);
+    listener.token = newToken;
+    console.log(`🔄 Updated token for ${email}`);
+  }
+}
+
+// Get active listener count
+function getActiveListenerCount() {
+  return activeListeners.size;
+}
+
+// Check if email has active listener
+function hasActiveListener(email) {
+  return activeListeners.has(email);
+}
+
+module.exports = {
+  startInboxListener,
+  stopInboxListener,
+  stopAllListeners,
+  updateListenerToken,
+  getActiveListenerCount,
+  hasActiveListener
+};
