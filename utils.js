@@ -1,278 +1,270 @@
 const axios = require('axios');
+const { saveEmail, updateLastAccess } = require('./db');
 
-// Mail.tm API base URL
-const API_BASE = 'https://api.mail.tm';
+const MAIL_TM_API = process.env.MAIL_TM_API || 'https://api.mail.tm';
 
-// Generate temporary email
-async function generateTempEmail() {
+// Generate random username
+function generateUsername() {
+  const prefixes = ['temp', 'quick', 'fast', 'instant', 'rapid', 'swift', 'flash', 'pro', 'cool', 'smart'];
+  const prefix = prefixes[Math.floor(Math.random() * prefixes.length)];
+  const number = Math.floor(Math.random() * 900000) + 100000;
+  return `${prefix}${number}`;
+}
+
+// Generate random password
+function generatePassword() {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%';
+  let password = 'TempMail';
+  for (let i = 0; i < 8; i++) {
+    password += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return password + '!';
+}
+
+// Get available domains from Mail.tm
+async function getAvailableDomains() {
   try {
-    // Step 1: Get available domains
-    const domainsResponse = await axios.get(`${API_BASE}/domains`);
-    const domains = domainsResponse.data['hydra:member'];
+    const response = await axios.get(`${MAIL_TM_API}/domains`, {
+      timeout: 10000
+    });
     
-    if (!domains || domains.length === 0) {
-      return { error: 'No domains available' };
+    if (response.data && response.data['hydra:member']) {
+      return response.data['hydra:member'].map(d => d.domain);
     }
     
-    const domain = domains[Math.floor(Math.random() * domains.length)].domain;
-    
-    // Step 2: Generate random username
-    const prefixes = ['temp', 'quick', 'fast', 'instant', 'rapid', 'swift', 'flash', 'zen', 'cool', 'neo'];
-    const username = prefixes[Math.floor(Math.random() * prefixes.length)] + 
-                     Math.floor(100000 + Math.random() * 900000);
-    
-    const email = `${username}@${domain}`;
-    const password = `TempMail${Math.floor(100 + Math.random() * 900)}!@#`;
-    
-    // Step 3: Create account
-    try {
-      await axios.post(`${API_BASE}/accounts`, {
-        address: email,
-        password: password
-      }, {
-        headers: { 'Content-Type': 'application/json' }
-      });
-    } catch (createError) {
-      if (createError.response) {
-        return { error: `Account creation failed: ${createError.response.data.message || createError.message}` };
-      }
-      return { error: `Account creation failed: ${createError.message}` };
-    }
-    
-    // Step 4: Get authentication token
-    try {
-      const tokenResponse = await axios.post(`${API_BASE}/token`, {
-        address: email,
-        password: password
-      }, {
-        headers: { 'Content-Type': 'application/json' }
-      });
-      
-      return {
-        email: email,
-        password: password,
-        token: tokenResponse.data.token,
-        domains: domains.map(d => d.domain)
-      };
-    } catch (tokenError) {
-      if (tokenError.response) {
-        return { error: `Token generation failed: ${tokenError.response.data.message || tokenError.message}` };
-      }
-      return { error: `Token generation failed: ${tokenError.message}` };
-    }
-    
+    return [];
   } catch (error) {
-    console.error('Generate email error:', error.message);
-    return { error: error.message };
+    console.error('Error fetching domains:', error.message);
+    return [];
   }
 }
 
-// Refresh authentication token
-async function refreshToken(email, password) {
+// Generate new email account
+async function generateNewEmail() {
   try {
-    const response = await axios.post(`${API_BASE}/token`, {
-      address: email,
-      password: password
-    }, {
-      headers: { 'Content-Type': 'application/json' }
-    });
+    // Get available domains
+    const domains = await getAvailableDomains();
     
-    return response.data.token;
+    if (domains.length === 0) {
+      return { error: 'No domains available' };
+    }
+
+    const domain = domains[Math.floor(Math.random() * domains.length)];
+    const username = generateUsername();
+    const email = `${username}@${domain}`;
+    const password = generatePassword();
+
+    // Create account
+    const createResponse = await axios.post(
+      `${MAIL_TM_API}/accounts`,
+      {
+        address: email,
+        password: password
+      },
+      {
+        headers: { 'Content-Type': 'application/json' },
+        timeout: 15000
+      }
+    );
+
+    if (createResponse.status !== 201) {
+      return { error: 'Failed to create account' };
+    }
+
+    // Get token
+    const tokenResponse = await axios.post(
+      `${MAIL_TM_API}/token`,
+      {
+        address: email,
+        password: password
+      },
+      {
+        headers: { 'Content-Type': 'application/json' },
+        timeout: 15000
+      }
+    );
+
+    if (!tokenResponse.data || !tokenResponse.data.token) {
+      return { error: 'Failed to get token' };
+    }
+
+    const token = tokenResponse.data.token;
+
+    // Save to database
+    await saveEmail(email, password, token);
+
+    return {
+      email,
+      password,
+      token,
+      domain
+    };
   } catch (error) {
-    console.error('Token refresh error:', error.message);
-    return null;
+    console.error('Error generating email:', error.message);
+    return { error: error.message };
   }
 }
 
 // Get inbox messages
-async function getInbox(token) {
+async function getInbox(token, email) {
   try {
-    const response = await axios.get(`${API_BASE}/messages`, {
-      headers: {
-        'Authorization': `Bearer ${token}`
+    const response = await axios.get(
+      `${MAIL_TM_API}/messages`,
+      {
+        headers: { 'Authorization': `Bearer ${token}` },
+        timeout: 10000
       }
-    });
-    
+    );
+
+    if (response.status === 401) {
+      // Token expired, return empty to trigger refresh
+      return [];
+    }
+
     const messages = response.data['hydra:member'] || [];
     
+    // Update last access
+    await updateLastAccess(email);
+
     return messages.map(msg => ({
+      from: msg.from.address,
+      subject: msg.subject,
       id: msg.id,
-      from: msg.from?.address || 'Unknown',
-      subject: msg.subject || 'No Subject',
-      intro: msg.intro || '',
       createdAt: msg.createdAt,
-      hasAttachments: msg.hasAttachments || false,
-      seen: msg.seen || false
+      hasAttachments: msg.attachments && msg.attachments.length > 0,
+      seen: msg.seen,
+      text: msg.text,
+      html: msg.html
     }));
-    
   } catch (error) {
     if (error.response && error.response.status === 401) {
-      return { error: '401 Unauthorized - Token expired' };
+      return []; // Token expired
     }
-    console.error('Get inbox error:', error.message);
-    return { error: error.message };
+    console.error('Error fetching inbox:', error.message);
+    return [];
   }
 }
 
-// Get full message details
-async function getMessage(token, messageId) {
+// Get full message content
+async function getMessageContent(token, messageId, email) {
   try {
-    const response = await axios.get(`${API_BASE}/messages/${messageId}`, {
-      headers: {
-        'Authorization': `Bearer ${token}`
+    const response = await axios.get(
+      `${MAIL_TM_API}/messages/${messageId}`,
+      {
+        headers: { 'Authorization': `Bearer ${token}` },
+        timeout: 10000
       }
-    });
-    
-    return {
-      id: response.data.id,
-      from: response.data.from?.address || 'Unknown',
-      to: response.data.to || [],
-      subject: response.data.subject || 'No Subject',
-      intro: response.data.intro || '',
-      text: response.data.text || '',
-      html: response.data.html || '',
-      hasAttachments: response.data.hasAttachments || false,
-      attachments: response.data.attachments || [],
-      createdAt: response.data.createdAt
-    };
-    
+    );
+
+    if (response.status === 401) {
+      return null;
+    }
+
+    // Update last access
+    await updateLastAccess(email);
+
+    return response.data;
   } catch (error) {
-    console.error('Get message error:', error.message);
-    return { error: error.message };
+    console.error('Error fetching message:', error.message);
+    return null;
   }
 }
 
 // Delete message
-async function deleteMessage(token, messageId) {
+async function deleteMessage(token, messageId, email) {
   try {
-    await axios.delete(`${API_BASE}/messages/${messageId}`, {
-      headers: {
-        'Authorization': `Bearer ${token}`
+    await axios.delete(
+      `${MAIL_TM_API}/messages/${messageId}`,
+      {
+        headers: { 'Authorization': `Bearer ${token}` },
+        timeout: 10000
       }
-    });
-    return { success: true };
+    );
+
+    // Update last access
+    await updateLastAccess(email);
+
+    return true;
   } catch (error) {
-    console.error('Delete message error:', error.message);
-    return { error: error.message };
+    console.error('Error deleting message:', error.message);
+    return false;
   }
 }
 
-// Detect OTP from message content
-function detectOTP(content) {
-  if (!content) return null;
-  
-  // Remove HTML tags
-  const cleanContent = content.replace(/<[^>]*>/g, ' ');
-  
-  // Multiple OTP patterns
+// Extract OTP from message text
+function extractOTP(text) {
+  if (!text) return null;
+
+  // Remove HTML tags if present
+  const cleanText = text.replace(/<[^>]*>/g, ' ');
+
+  // Common OTP patterns (ordered by specificity)
   const patterns = [
-    /\b(\d{4})\b/,                    // 4-digit OTP
-    /\b(\d{5})\b/,                    // 5-digit OTP
-    /\b(\d{6})\b/,                    // 6-digit OTP (most common)
-    /\b(\d{8})\b/,                    // 8-digit OTP
-    /code[:\s]+(\d{4,8})/i,           // "code: 123456"
-    /verification[:\s]+(\d{4,8})/i,   // "verification: 123456"
-    /otp[:\s]+(\d{4,8})/i,            // "OTP: 123456"
-    /pin[:\s]+(\d{4,8})/i,            // "PIN: 123456"
-    /token[:\s]+(\d{4,8})/i,          // "token: 123456"
-    /code is[:\s]+(\d{4,8})/i,        // "code is 123456"
-    /your code[:\s]+(\d{4,8})/i,      // "your code: 123456"
-    /confirm[:\s]+(\d{4,8})/i,        // "confirm: 123456"
-    /(\d{6})\s*is your/i,             // "123456 is your verification"
-    /(\d{4,8})\s*to verify/i,         // "123456 to verify"
+    // Specific context patterns (more reliable)
+    /(?:OTP|code|verification code|verification|pin|passcode)[\s:]*[\(\[]?(\d{4,8})[\)\]]?/gi,
+    /(?:Your code is|code is|your otp is|your pin is)[\s:]*[\(\[]?(\d{4,8})[\)\]]?/gi,
+    /(\d{4,8})(?:\s+(?:is your|is the|is your verification))/gi,
+    // Standalone digit patterns (less reliable, checked last)
+    /\b(\d{6})\b/g,  // 6-digit codes (most common)
+    /\b(\d{4})\b/g,  // 4-digit codes
+    /\b(\d{8})\b/g,  // 8-digit codes
+    /\b([A-Z0-9]{6})\b/g  // 6-char alphanumeric
   ];
-  
+
   for (const pattern of patterns) {
-    const match = cleanContent.match(pattern);
+    pattern.lastIndex = 0; // Reset regex
+    const match = pattern.exec(cleanText);
+    
     if (match && match[1]) {
-      const otp = match[1];
-      // Validate OTP length (4-8 digits)
-      if (otp.length >= 4 && otp.length <= 8) {
-        return otp;
+      const code = match[1].trim();
+      // Validate code length
+      if (code.length >= 4 && code.length <= 8) {
+        // Extra validation: avoid common false positives
+        if (!/^(1234|0000|9999|1111|2222)/.test(code)) {
+          return code;
+        }
       }
     }
   }
-  
+
   return null;
 }
 
-// Format message for Telegram display
-function formatMessageForTelegram(message, otp = null) {
-  let text = `📩 New Mail Received In Your Email ID 🪧\n`;
-  text += `📇 From : ${message.from}\n`;
-  text += `🗒️ Subject : ${message.subject || 'No Subject'}\n`;
-  
-  // Clean and truncate intro text
-  let intro = message.intro || message.text || 'No preview available';
-  intro = intro.replace(/<[^>]*>/g, '').trim();
-  if (intro.length > 200) {
-    intro = intro.substring(0, 200) + '...';
+// Refresh token for expired sessions
+async function refreshToken(email, password) {
+  try {
+    const tokenResponse = await axios.post(
+      `${MAIL_TM_API}/token`,
+      {
+        address: email,
+        password: password
+      },
+      {
+        headers: { 'Content-Type': 'application/json' },
+        timeout: 15000
+      }
+    );
+
+    if (tokenResponse.data && tokenResponse.data.token) {
+      // Update token in database
+      await saveEmail(email, password, tokenResponse.data.token);
+      return tokenResponse.data.token;
+    }
+
+    return null;
+  } catch (error) {
+    console.error('Error refreshing token:', error.message);
+    return null;
   }
-  
-  text += `💬 Text : ${intro}\n`;
-  
-  if (otp) {
-    text += `\n👉 OTP : \`${otp}\``;
-  }
-  
-  return text;
-}
-
-// Validate email format
-function isValidEmail(email) {
-  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-  return emailRegex.test(email);
-}
-
-// Generate random string (for future features)
-function generateRandomString(length = 10) {
-  const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-  let result = '';
-  for (let i = 0; i < length; i++) {
-    result += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return result;
-}
-
-// Delay function (for rate limiting)
-function delay(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-// Extract plain text from HTML
-function htmlToText(html) {
-  if (!html) return '';
-  
-  // Remove script and style tags
-  let text = html.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '');
-  text = text.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '');
-  
-  // Replace common HTML entities
-  text = text.replace(/&nbsp;/g, ' ');
-  text = text.replace(/&amp;/g, '&');
-  text = text.replace(/&lt;/g, '<');
-  text = text.replace(/&gt;/g, '>');
-  text = text.replace(/&quot;/g, '"');
-  
-  // Remove HTML tags
-  text = text.replace(/<[^>]*>/g, ' ');
-  
-  // Clean up whitespace
-  text = text.replace(/\s+/g, ' ').trim();
-  
-  return text;
 }
 
 module.exports = {
-  generateTempEmail,
-  refreshToken,
+  generateNewEmail,
   getInbox,
-  getMessage,
+  getMessageContent,
   deleteMessage,
-  detectOTP,
-  formatMessageForTelegram,
-  isValidEmail,
-  generateRandomString,
-  delay,
-  htmlToText
+  extractOTP,
+  refreshToken,
+  generateUsername,
+  generatePassword
 };
